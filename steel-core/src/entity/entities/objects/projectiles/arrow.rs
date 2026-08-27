@@ -281,7 +281,7 @@ impl Entity for ArrowEntity {
             self.set_in_ground(true);
         }
 
-        if self.is_in_ground() {
+        if self.is_in_ground() && !self.no_physics() {
             let current = world.get_block_state(self.block_position());
             // A missing `last_state` (fresh load without persisted block data)
             // counts as changed, like vanilla's null `lastState` check.
@@ -292,6 +292,9 @@ impl Entity for ArrowEntity {
             } else {
                 self.tick_despawn();
                 self.runtime.lock().in_ground_time += 1;
+                if self.is_alive() {
+                    self.apply_effects_from_blocks();
+                }
                 return;
             }
         } else {
