@@ -16,20 +16,21 @@ use glam::DVec3;
 use simdnbt::borrow::NbtCompound as BorrowedNbtCompoundView;
 use simdnbt::owned::NbtCompound;
 use steel_macros::entity_behavior;
-use steel_protocol::packets::game::SoundSource;
+use steel_protocol::packets::game::{CTakeItemEntity, SoundSource};
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::entity_type::EntityTypeRef;
 use steel_registry::item_stack::ItemStack;
 use steel_registry::vanilla_entity_data::ArrowEntityData;
 use steel_registry::{sound_events, vanilla_damage_types, vanilla_entities, vanilla_items};
 use steel_utils::locks::SyncMutex;
-use steel_utils::{BlockStateId, DowncastType, DowncastTypeKey};
+use steel_utils::{BlockStateId, ChunkPos, DowncastType, DowncastTypeKey};
 
 use crate::entity::damage::DamageSource;
 use crate::entity::{
     Entity, EntityBase, EntityBaseLoad, EntitySyncedData, Projectile, ProjectileBase,
-    RemovalReason, SharedEntity,
+    ProjectileDeflection, RemovalReason, SharedEntity,
 };
+use crate::inventory::container::Container;
 use crate::player::Player;
 use crate::world::{ClipHitResult, LevelReader as _, World};
 
@@ -45,6 +46,23 @@ const INERTIA: f64 = 0.99;
 const DESPAWN_LIFE: i32 = 1200;
 /// Vanilla `AbstractArrow.getDefaultGravity`.
 const GRAVITY: f64 = 0.05;
+/// Vanilla `AbstractArrow.onHitBlock` backoff distance from block surface.
+const HIT_BLOCK_BACKOFF: f64 = 0.05;
+/// Vanilla `AbstractArrow.startFalling` jitter scale for each axis.
+const START_FALLING_JITTER: f64 = 0.2;
+/// Vanilla `AbstractArrow.onHitEntity` post-deflection velocity scale.
+/// Applied after `deflect(REVERSE)` which uses -0.5, yielding total -0.1.
+const DEFLECTION_POST_SCALE: f64 = 0.2;
+/// Velocity threshold below which a deflected arrow is considered stopped.
+const DEFLECTION_STOP_THRESHOLD: f64 = 1.0e-7;
+/// Vanilla crit damage bonus range: `random(damage / 2 + CRIT_DAMAGE_FLOOR)`.
+const CRIT_DAMAGE_FLOOR: i32 = 2;
+/// Vanilla `AbstractArrow.getHitGroundSoundEvent` pitch formula denominator.
+const HIT_SOUND_PITCH_BASE: f32 = 0.9;
+/// Vanilla `AbstractArrow.getHitGroundSoundEvent` pitch formula numerator.
+const HIT_SOUND_PITCH_NUMERATOR: f32 = 1.2;
+/// Vanilla `AbstractArrow.getHitGroundSoundEvent` pitch random range.
+const HIT_SOUND_PITCH_RANDOM_RANGE: f32 = 0.2;
 
 /// Vanilla `AbstractArrow.Pickup`. Ordinals match the vanilla enum for NBT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,6 +99,9 @@ struct ArrowRuntime {
     pickup: Pickup,
     /// Vanilla `lastState` — block that held the arrow when it landed.
     last_state: Option<BlockStateId>,
+    /// Entity ID that deflected this arrow last tick, used to suppress
+    /// repeated collision while the arrow exits the entity's bounding box.
+    last_deflected_by: Option<i32>,
 }
 
 impl ArrowRuntime {
@@ -92,6 +113,7 @@ impl ArrowRuntime {
             base_damage: ARROW_BASE_DAMAGE,
             pickup: Pickup::Disallowed,
             last_state: None,
+            last_deflected_by: None,
         }
     }
 }
@@ -176,9 +198,9 @@ impl ArrowEntity {
     fn start_falling(&self) {
         self.set_in_ground(false);
         let jitter = DVec3::new(
-            f64::from(rand::random::<f32>() * 0.2),
-            f64::from(rand::random::<f32>() * 0.2),
-            f64::from(rand::random::<f32>() * 0.2),
+            f64::from(rand::random::<f32>()) * START_FALLING_JITTER,
+            f64::from(rand::random::<f32>()) * START_FALLING_JITTER,
+            f64::from(rand::random::<f32>()) * START_FALLING_JITTER,
         );
         self.set_velocity(self.velocity() * jitter);
         self.runtime.lock().life = 0;
@@ -199,14 +221,15 @@ impl ArrowEntity {
     fn stick_in_ground(&self, world: &Arc<World>) {
         let movement = self.velocity();
         let offset = DVec3::new(
-            movement.x.signum() * 0.05,
-            movement.y.signum() * 0.05,
-            movement.z.signum() * 0.05,
+            movement.x.signum() * HIT_BLOCK_BACKOFF,
+            movement.y.signum() * HIT_BLOCK_BACKOFF,
+            movement.z.signum() * HIT_BLOCK_BACKOFF,
         );
         let _ = self.try_set_position(self.position() - offset);
         self.set_velocity(DVec3::ZERO);
 
-        let pitch = 1.2 / (rand::random::<f32>() * 0.2 + 0.9);
+        let pitch = HIT_SOUND_PITCH_NUMERATOR
+            / (rand::random::<f32>() * HIT_SOUND_PITCH_RANDOM_RANGE + HIT_SOUND_PITCH_BASE);
         world.play_sound_at(
             &sound_events::ENTITY_ARROW_HIT,
             SoundSource::Neutral,
@@ -219,6 +242,10 @@ impl ArrowEntity {
         self.set_in_ground(true);
         let mut runtime = self.runtime.lock();
         runtime.shake_time = SHAKE_TIME;
+        // After the position offset, update last_state to match the block at
+        // the new resting position so the in-ground changed-block check does
+        // not incorrectly detect a block change and restart the flight loop.
+        runtime.last_state = Some(world.get_block_state(self.block_position()));
         drop(runtime);
         self.set_crit_arrow(false);
         self.entity_data.lock().abstract_arrow.pierce_level.set(0);
@@ -292,18 +319,21 @@ impl Entity for ArrowEntity {
         }
         self.runtime.lock().last_state = Some(world.get_block_state(self.block_position()));
 
+        // Vanilla ordering: hit detection runs BEFORE air drag and gravity.
+        // Deflection changes velocity, so drag/gravity must apply to the
+        // post-deflection velocity, not the pre-hit velocity.
+        if let Some(result) = hit
+            && self.is_alive()
+        {
+            self.hit_target_or_deflect_self(&result);
+        }
+
         if !self.is_in_water() {
             self.set_velocity(self.velocity() * INERTIA);
         }
         // Vanilla skips gravity once this tick's hit has grounded the arrow.
         if !self.is_in_ground() {
             self.apply_gravity();
-        }
-
-        if let Some(result) = hit
-            && self.is_alive()
-        {
-            self.hit_target_or_deflect_self(&result);
         }
 
         // Vanilla runs `super.tick()` at the very end of the flight branch
@@ -380,17 +410,33 @@ impl Entity for ArrowEntity {
         if self.is_removed() || !self.is_in_ground() || self.runtime.lock().shake_time > 0 {
             return;
         }
-        let collected = match self.runtime.lock().pickup {
+
+        // Vanilla tryPickup: check pickup permission and try inventory add.
+        let picked = match self.runtime.lock().pickup {
             Pickup::Disallowed => false,
+            Pickup::Allowed => {
+                let mut item = ItemStack::new(&vanilla_items::ARROW);
+                let added = player.inventory.lock().add(&mut item);
+                // Only succeed if the entire stack was consumed (inventory had space).
+                added && item.is_empty()
+            }
             Pickup::CreativeOnly => player.has_infinite_materials(),
-            Pickup::Allowed => true,
         };
-        if !collected {
+
+        if !picked {
             return;
         }
-        // TODO: leave the arrow in-world when the inventory cannot fit it
-        // (vanilla only picks up when `inventory.add` succeeds fully).
-        player.add_item_or_drop(ItemStack::new(&vanilla_items::ARROW));
+
+        // Vanilla player.take: send pickup animation to tracking clients.
+        if let Some(world) = self.level() {
+            let take_packet = CTakeItemEntity::new(self.id(), player.id(), 1);
+            world.broadcast_to_nearby(
+                ChunkPos::from_entity_pos(self.position()),
+                take_packet,
+                None,
+            );
+        }
+
         self.set_removed(RemovalReason::Discarded);
     }
 }
@@ -402,6 +448,13 @@ impl Projectile for ArrowEntity {
 
     /// Vanilla `AbstractArrow.onHitEntity`.
     fn on_hit_entity(&self, entity: &SharedEntity, _location: DVec3) {
+        // Skip if this entity deflected us last tick — gives the arrow one
+        // tick to exit the bounding box before processing another collision.
+        if self.runtime.lock().last_deflected_by == Some(entity.id()) {
+            self.runtime.lock().last_deflected_by = None;
+            return;
+        }
+
         let Some(world) = entity.level() else {
             return;
         };
@@ -410,7 +463,8 @@ impl Projectile for ArrowEntity {
         let raw = speed * self.runtime.lock().base_damage as f32;
         let mut damage_amount = raw.ceil().clamp(0.0, i32::MAX as f32) as i32;
         if self.is_crit_arrow() {
-            damage_amount += (rand::random::<u32>() % (damage_amount / 2 + 2) as u32) as i32;
+            damage_amount +=
+                (rand::random::<u32>() % (damage_amount / 2 + CRIT_DAMAGE_FLOOR) as u32) as i32;
         }
 
         // Vanilla `damageSources().arrow(this, owner != null ? owner : this)`.
@@ -419,11 +473,16 @@ impl Projectile for ArrowEntity {
             .with_causing_entity(self.get_owner().map_or(self.id(), |owner| owner.id()));
 
         if entity.hurt(&world, &damage, damage_amount as f32) {
+            // Arrow dealt damage — clear any deflection cooldown since the
+            // arrow is about to be discarded.
+            self.runtime.lock().last_deflected_by = None;
+
             // Vanilla lets arrows pass through endermen without sound or discard.
             if entity.entity_type() == &vanilla_entities::ENDERMAN {
                 return;
             }
-            let pitch = 1.2 / (rand::random::<f32>() * 0.2 + 0.9);
+            let pitch = HIT_SOUND_PITCH_NUMERATOR
+                / (rand::random::<f32>() * HIT_SOUND_PITCH_RANDOM_RANGE + HIT_SOUND_PITCH_BASE);
             world.play_sound_at(
                 &sound_events::ENTITY_ARROW_HIT,
                 SoundSource::Neutral,
@@ -434,10 +493,22 @@ impl Projectile for ArrowEntity {
             );
             self.set_removed(RemovalReason::Discarded);
         } else {
-            // Vanilla deflect path: `REVERSE` deflection plus a `scale(0.2)`
-            // shrink; a near-stopped allowed arrow drops as an item.
-            self.set_velocity(self.velocity() * -0.2);
-            if self.velocity().length_squared() < 1.0e-7 {
+            // Vanilla deflect path: `deflect(REVERSE)` → `velocity * 0.2`.
+            // deflect(REVERSE) applies `velocity * -0.5`, then the extra
+            // `* 0.2` yields `velocity * -0.1` total — matching vanilla.
+            self.deflect(
+                ProjectileDeflection::Reverse,
+                Some(entity.as_ref()),
+                self.owner_uuid(),
+                self.projectile_owner().as_ref(),
+                false,
+            );
+            self.set_velocity(self.velocity() * DEFLECTION_POST_SCALE);
+
+            // Suppress re-collision with this entity on the next tick.
+            self.runtime.lock().last_deflected_by = Some(entity.id());
+
+            if self.velocity().length_squared() < DEFLECTION_STOP_THRESHOLD {
                 if self.runtime.lock().pickup == Pickup::Allowed {
                     world.spawn_item(self.position(), ItemStack::new(&vanilla_items::ARROW));
                 }
